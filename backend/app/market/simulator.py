@@ -55,7 +55,8 @@ class Simulator(MarketDataProvider):
     def __init__(self):
         self._task: asyncio.Task | None = None
         self._tickers = list(TICKER_CONFIG.keys())
-        self._prices = {t: cfg["seed"] for t, cfg in TICKER_CONFIG.items()}
+        self._config = {t: dict(cfg) for t, cfg in TICKER_CONFIG.items()}
+        self._prices = {t: cfg["seed"] for t, cfg in self._config.items()}
         self._dt = UPDATE_INTERVAL / (252 * 6.5 * 3600)  # fraction of trading year
 
         # Precompute Cholesky decomposition for correlated random draws
@@ -84,15 +85,42 @@ class Simulator(MarketDataProvider):
             self._step()
             await asyncio.sleep(UPDATE_INTERVAL)
 
+    async def add_ticker(self, ticker: str) -> None:
+        """Add a new ticker to the simulation with a default config."""
+        ticker = ticker.upper()
+        if ticker in self._tickers:
+            return
+        cfg = dict(TICKER_CONFIG.get(ticker, {"seed": 100.0, "drift": 0.08, "vol": 0.30}))
+        self._config[ticker] = cfg
+        self._tickers.append(ticker)
+        self._prices[ticker] = cfg["seed"]
+        corr = _build_correlation_matrix(self._tickers)
+        self._cholesky = np.linalg.cholesky(corr)
+        price_cache.update(ticker, cfg["seed"])
+
+    async def remove_ticker(self, ticker: str) -> None:
+        """Remove a ticker from the simulation."""
+        ticker = ticker.upper()
+        if ticker not in self._tickers:
+            return
+        self._tickers.remove(ticker)
+        self._prices.pop(ticker, None)
+        self._config.pop(ticker, None)
+        if self._tickers:
+            corr = _build_correlation_matrix(self._tickers)
+            self._cholesky = np.linalg.cholesky(corr)
+
     def _step(self) -> None:
         """Advance all prices by one GBM step with correlation."""
         n = len(self._tickers)
+        if n == 0:
+            return
         # Correlated normal draws
         z_independent = np.random.standard_normal(n)
         z_correlated = self._cholesky @ z_independent
 
         for i, ticker in enumerate(self._tickers):
-            cfg = TICKER_CONFIG[ticker]
+            cfg = self._config[ticker]
             drift = cfg["drift"]
             vol = cfg["vol"]
             s = self._prices[ticker]

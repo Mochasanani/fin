@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.database import get_db
 from app.market.cache import price_cache
+from app.market.provider import get_provider
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -74,10 +75,15 @@ async def add_ticker(body: AddTickerRequest):
             (str(uuid.uuid4()), ticker, now),
         )
         await db.commit()
-        update = price_cache.get(ticker)
-        return WatchlistItem(ticker=ticker, price=update.price if update else None)
     finally:
         await db.close()
+
+    provider = get_provider()
+    if provider is not None:
+        await provider.add_ticker(ticker)
+
+    update = price_cache.get(ticker)
+    return WatchlistItem(ticker=ticker, price=update.price if update else None)
 
 
 @router.delete("/{ticker}")
@@ -93,6 +99,10 @@ async def remove_ticker(ticker: str):
         await db.commit()
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail=f"{ticker} not in watchlist")
-        return {"ok": True}
     finally:
         await db.close()
+
+    provider = get_provider()
+    if provider is not None:
+        await provider.remove_ticker(ticker)
+    return {"ok": True}
