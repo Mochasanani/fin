@@ -14,14 +14,23 @@ vi.mock("recharts", () => ({
 // Mock lightweight-charts
 vi.mock("lightweight-charts", () => ({
   createChart: () => ({
-    addLineSeries: () => ({ setData: vi.fn(), update: vi.fn() }),
+    addSeries: () => ({ setData: vi.fn(), update: vi.fn() }),
     timeScale: () => ({ fitContent: vi.fn() }),
     applyOptions: vi.fn(),
     remove: vi.fn(),
   }),
   ColorType: { Solid: 0 },
   LineType: { Simple: 0 },
+  LineSeries: {},
 }));
+
+// Mock ResizeObserver for MainChart
+class MockResizeObserver {
+  observe = vi.fn();
+  unobserve = vi.fn();
+  disconnect = vi.fn();
+}
+vi.stubGlobal("ResizeObserver", MockResizeObserver);
 
 // Mock EventSource for useMarketData
 class MockEventSource {
@@ -29,6 +38,8 @@ class MockEventSource {
   onmessage: ((e: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
   close = vi.fn();
+  addEventListener = vi.fn();
+  removeEventListener = vi.fn();
   constructor() {
     setTimeout(() => this.onopen?.(), 0);
   }
