@@ -4,10 +4,33 @@ import os
 
 os.environ["LLM_MOCK"] = "true"
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from app.market.cache import price_cache
+
+
+@pytest.fixture(autouse=True)
+def seed_prices():
+    """Seed price cache so chat-driven trades have a current price."""
+    for ticker, price in [
+        ("AAPL", 150.0),
+        ("GOOGL", 175.0),
+        ("MSFT", 400.0),
+        ("AMZN", 180.0),
+        ("TSLA", 250.0),
+        ("NVDA", 900.0),
+        ("META", 500.0),
+        ("JPM", 200.0),
+        ("V", 280.0),
+        ("NFLX", 600.0),
+        ("PYPL", 70.0),
+    ]:
+        price_cache.update(ticker, price)
+    yield
+    price_cache._prices.clear()
 
 
 @pytest_asyncio.fixture
@@ -118,3 +141,220 @@ async def test_chat_fallback(client):
     resp = await client.post("/api/chat", json={"message": "random nonsense xyz"})
     data = resp.json()
     assert "trade" in data["message"].lower() or "portfolio" in data["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Auto-execution reflects in /api/portfolio and /api/watchlist (acceptance
+# criterion: trades and watchlist changes auto-execute and reflect downstream).
+# ---------------------------------------------------------------------------
+
+
+async def test_chat_buy_reflects_in_portfolio(client):
+    await client.post("/api/chat", json={"message": "buy some AAPL"})
+    resp = await client.get("/api/portfolio")
+    data = resp.json()
+    tickers = {p["ticker"] for p in data["positions"]}
+    assert "AAPL" in tickers
+    assert data["cash_balance"] == 10000.0 - (10 * 150.0)
+
+
+async def test_chat_watchlist_add_reflects_in_watchlist(client):
+    await client.post("/api/chat", json={"message": "add PYPL to watchlist"})
+    resp = await client.get("/api/watchlist")
+    tickers = [item["ticker"] for item in resp.json()]
+    assert "PYPL" in tickers
+
+
+async def test_chat_watchlist_remove_reflects_in_watchlist(client):
+    await client.post("/api/chat", json={"message": "remove NFLX"})
+    resp = await client.get("/api/watchlist")
+    tickers = [item["ticker"] for item in resp.json()]
+    assert "NFLX" not in tickers
+
+
+async def test_chat_persists_messages_with_actions(client):
+    """User and assistant messages persist to chat_messages with actions JSON."""
+    import json
+    import app.database as database
+
+    await client.post("/api/chat", json={"message": "buy some MSFT"})
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute(
+            "SELECT role, content, actions FROM chat_messages "
+            "WHERE user_id = 'default' ORDER BY created_at, role"
+        )
+        rows = await cur.fetchall()
+    finally:
+        await db.close()
+
+    roles = [r["role"] for r in rows]
+    assert "user" in roles and "assistant" in roles
+
+    assistant_row = next(r for r in rows if r["role"] == "assistant")
+    user_row = next(r for r in rows if r["role"] == "user")
+    assert user_row["actions"] is None
+    actions = json.loads(assistant_row["actions"])
+    assert actions["trades"][0]["ticker"] == "MSFT"
+
+
+# ---------------------------------------------------------------------------
+# Direct LLM call: schema parsing, malformed handling, validation failures.
+# These tests exercise the non-mock path by stubbing litellm.acompletion.
+# ---------------------------------------------------------------------------
+
+
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content):
+        self.message = _FakeMessage(content)
+
+
+class _FakeResponse:
+    def __init__(self, content):
+        self.choices = [_FakeChoice(content)]
+
+
+@pytest_asyncio.fixture
+async def llm_real_client(client, monkeypatch):
+    """Client with LLM_MOCK disabled so _call_llm is exercised."""
+    monkeypatch.setenv("LLM_MOCK", "false")
+    yield client
+
+
+async def test_chat_parses_valid_structured_response(llm_real_client, monkeypatch):
+    """Schema parsing: valid JSON from the LLM is parsed into ChatResponse and
+    actions auto-execute."""
+    import json
+    import app.chat as chat_mod
+
+    payload = json.dumps(
+        {
+            "message": "Buying TSLA",
+            "trades": [{"ticker": "TSLA", "side": "buy", "quantity": 5}],
+            "watchlist_changes": [{"ticker": "PYPL", "action": "add"}],
+        }
+    )
+
+    async def fake_acompletion(**kwargs):
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(chat_mod, "acompletion", fake_acompletion)
+
+    resp = await llm_real_client.post("/api/chat", json={"message": "buy 5 TSLA"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["message"].startswith("Buying TSLA")
+    assert data["trades"][0]["ticker"] == "TSLA"
+    assert data["watchlist_changes"][0]["ticker"] == "PYPL"
+
+    # Reflects downstream
+    pf = (await llm_real_client.get("/api/portfolio")).json()
+    assert any(p["ticker"] == "TSLA" for p in pf["positions"])
+
+
+async def test_chat_malformed_json_returns_502(llm_real_client, monkeypatch):
+    """Malformed handling: non-JSON content surfaces as 502."""
+    import app.chat as chat_mod
+
+    async def fake_acompletion(**kwargs):
+        return _FakeResponse("not json at all {{{")
+
+    monkeypatch.setattr(chat_mod, "acompletion", fake_acompletion)
+
+    resp = await llm_real_client.post("/api/chat", json={"message": "hi"})
+    assert resp.status_code == 502
+    assert "Malformed" in resp.json()["detail"]
+
+
+async def test_chat_schema_violation_returns_502(llm_real_client, monkeypatch):
+    """Malformed handling: JSON missing required `message` field surfaces as 502."""
+    import json
+    import app.chat as chat_mod
+
+    async def fake_acompletion(**kwargs):
+        return _FakeResponse(json.dumps({"trades": []}))  # no "message"
+
+    monkeypatch.setattr(chat_mod, "acompletion", fake_acompletion)
+
+    resp = await llm_real_client.post("/api/chat", json={"message": "hi"})
+    assert resp.status_code == 502
+
+
+async def test_chat_invalid_trade_validation_failure(llm_real_client, monkeypatch):
+    """Validation failure: LLM-requested sell of unheld shares records the
+    error in the user-facing message but the response still parses."""
+    import json
+    import app.chat as chat_mod
+
+    payload = json.dumps(
+        {
+            "message": "Selling AAPL",
+            "trades": [{"ticker": "AAPL", "side": "sell", "quantity": 100}],
+        }
+    )
+
+    async def fake_acompletion(**kwargs):
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(chat_mod, "acompletion", fake_acompletion)
+
+    resp = await llm_real_client.post("/api/chat", json={"message": "sell 100 AAPL"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "Insufficient shares" in data["message"]
+
+
+async def test_chat_invokes_cerebras_provider(llm_real_client, monkeypatch):
+    """The non-mock path routes through OpenRouter with Cerebras provider and
+    requests a JSON schema response_format."""
+    import json
+    import app.chat as chat_mod
+
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return _FakeResponse(json.dumps({"message": "ok"}))
+
+    monkeypatch.setattr(chat_mod, "acompletion", fake_acompletion)
+
+    resp = await llm_real_client.post("/api/chat", json={"message": "hi"})
+    assert resp.status_code == 200
+    assert captured["model"] == "openrouter/openai/gpt-oss-120b"
+    assert captured["response_format"]["type"] == "json_schema"
+    assert captured["extra_body"]["provider"]["order"] == ["cerebras"]
+
+
+async def test_chat_loads_portfolio_context(llm_real_client, monkeypatch):
+    """Portfolio context (cash, positions, watchlist+prices, total) is built
+    into the LLM prompt."""
+    import json
+    import app.chat as chat_mod
+
+    # Open a position so we get a P&L line in context.
+    await llm_real_client.post(
+        "/api/portfolio/trade",
+        json={"ticker": "AAPL", "quantity": 5, "side": "buy"},
+    )
+
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return _FakeResponse(json.dumps({"message": "ok"}))
+
+    monkeypatch.setattr(chat_mod, "acompletion", fake_acompletion)
+
+    await llm_real_client.post("/api/chat", json={"message": "what's my portfolio?"})
+
+    system_msgs = [m["content"] for m in captured["messages"] if m["role"] == "system"]
+    ctx = next(m for m in system_msgs if "Cash:" in m)
+    assert "AAPL" in ctx
+    assert "Watchlist:" in ctx
+    assert "Total portfolio value" in ctx

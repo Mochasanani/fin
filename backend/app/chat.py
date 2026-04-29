@@ -5,12 +5,15 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, ValidationError
 
 from litellm import acompletion
 
 from app.database import get_db
+from app.market.cache import price_cache
+from app.market.provider import get_provider
+from app.portfolio import TradeValidationError, perform_trade
 
 router = APIRouter()
 
@@ -25,7 +28,7 @@ class ChatRequest(BaseModel):
 
 class TradeAction(BaseModel):
     ticker: str
-    side: str
+    side: str  # "buy" | "sell"
     quantity: float
 
 
@@ -38,6 +41,49 @@ class ChatResponse(BaseModel):
     message: str
     trades: list[TradeAction] | None = None
     watchlist_changes: list[WatchlistChange] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Structured output schema (JSON Schema for OpenRouter structured outputs)
+# ---------------------------------------------------------------------------
+
+RESPONSE_JSON_SCHEMA = {
+    "name": "FinAllyResponse",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "message": {"type": "string"},
+            "trades": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "ticker": {"type": "string"},
+                        "side": {"type": "string", "enum": ["buy", "sell"]},
+                        "quantity": {"type": "number"},
+                    },
+                    "required": ["ticker", "side", "quantity"],
+                },
+            },
+            "watchlist_changes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "ticker": {"type": "string"},
+                        "action": {"type": "string", "enum": ["add", "remove"]},
+                    },
+                    "required": ["ticker", "action"],
+                },
+            },
+        },
+        "required": ["message"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -76,21 +122,19 @@ Rules:
 
 
 async def _load_portfolio_context(db) -> str:
-    """Build a text summary of the user's portfolio for the LLM."""
-    # Cash balance
+    """Build a text summary of the user's portfolio (cash, positions+P&L,
+    watchlist+prices, total) for the LLM."""
     cur = await db.execute(
         "SELECT cash_balance FROM users_profile WHERE id = 'default'"
     )
     row = await cur.fetchone()
     cash = row["cash_balance"] if row else 10000.0
 
-    # Positions
     cur = await db.execute(
         "SELECT ticker, quantity, avg_cost FROM positions WHERE user_id = 'default'"
     )
     positions = await cur.fetchall()
 
-    # Watchlist
     cur = await db.execute(
         "SELECT ticker FROM watchlist WHERE user_id = 'default'"
     )
@@ -98,20 +142,32 @@ async def _load_portfolio_context(db) -> str:
 
     lines = [f"Cash: ${cash:,.2f}"]
 
+    positions_value = 0.0
     if positions:
         lines.append("Positions:")
-        total_cost = 0.0
         for p in positions:
-            value = p["quantity"] * p["avg_cost"]
-            total_cost += value
+            entry = price_cache.get(p["ticker"])
+            current = entry.price if entry else p["avg_cost"]
+            pnl = (current - p["avg_cost"]) * p["quantity"]
+            pnl_pct = ((current - p["avg_cost"]) / p["avg_cost"] * 100) if p["avg_cost"] else 0
+            positions_value += current * p["quantity"]
             lines.append(
-                f"  {p['ticker']}: {p['quantity']} shares @ avg ${p['avg_cost']:.2f}"
+                f"  {p['ticker']}: {p['quantity']} @ avg ${p['avg_cost']:.2f}"
+                f" (now ${current:.2f}, P&L ${pnl:+,.2f} {pnl_pct:+.2f}%)"
             )
-        lines.append(f"Total invested (at cost): ${total_cost:,.2f}")
     else:
         lines.append("Positions: none")
 
-    lines.append(f"Watchlist: {', '.join(watchlist) if watchlist else 'empty'}")
+    if watchlist:
+        prices = []
+        for t in watchlist:
+            entry = price_cache.get(t)
+            prices.append(f"{t} ${entry.price:.2f}" if entry else t)
+        lines.append("Watchlist: " + ", ".join(prices))
+    else:
+        lines.append("Watchlist: empty")
+
+    lines.append(f"Total portfolio value: ${cash + positions_value:,.2f}")
     return "\n".join(lines)
 
 
@@ -121,20 +177,29 @@ async def _load_portfolio_context(db) -> str:
 
 
 async def _load_history(db, limit: int = 20) -> list[dict]:
-    """Load recent chat messages for context."""
+    """Load recent chat messages for context (oldest first)."""
     cur = await db.execute(
         "SELECT role, content FROM chat_messages "
         "WHERE user_id = 'default' ORDER BY created_at DESC LIMIT ?",
         (limit,),
     )
     rows = await cur.fetchall()
-    # Reverse so oldest first
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
 # ---------------------------------------------------------------------------
 # Mock mode
 # ---------------------------------------------------------------------------
+
+
+_MOCK_TICKERS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]
+
+
+def _mock_pick_ticker(text: str) -> str:
+    for t in _MOCK_TICKERS:
+        if t.lower() in text:
+            return t
+    return "AAPL"
 
 
 def _mock_response(message: str) -> ChatResponse:
@@ -156,23 +221,14 @@ def _mock_response(message: str) -> ChatResponse:
         )
 
     if "buy" in lower:
-        # Extract ticker if mentioned
-        ticker = "AAPL"
-        for t in ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]:
-            if t.lower() in lower:
-                ticker = t
-                break
+        ticker = _mock_pick_ticker(lower)
         return ChatResponse(
             message=f"Buying 10 shares of {ticker} for you.",
             trades=[TradeAction(ticker=ticker, side="buy", quantity=10)],
         )
 
     if "sell" in lower:
-        ticker = "AAPL"
-        for t in ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]:
-            if t.lower() in lower:
-                ticker = t
-                break
+        ticker = _mock_pick_ticker(lower)
         return ChatResponse(
             message=f"Selling 10 shares of {ticker} for you.",
             trades=[TradeAction(ticker=ticker, side="sell", quantity=10)],
@@ -197,105 +253,6 @@ def _mock_response(message: str) -> ChatResponse:
 
 
 # ---------------------------------------------------------------------------
-# Trade execution
-# ---------------------------------------------------------------------------
-
-
-async def _execute_trade(
-    db, ticker: str, side: str, quantity: float
-) -> str | None:
-    """Execute a trade. Returns error string on failure, None on success."""
-    # We need a price. Use avg_cost for sells, or a default for buys.
-    # In a full system this comes from the price cache. For now, use a
-    # placeholder price of 100.0 if no market data is available.
-    # TODO: integrate with market data price cache when available
-    price = 150.0  # default placeholder
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    if side == "buy":
-        cost = price * quantity
-        cur = await db.execute(
-            "SELECT cash_balance FROM users_profile WHERE id = 'default'"
-        )
-        row = await cur.fetchone()
-        cash = row["cash_balance"]
-        if cost > cash:
-            return f"Insufficient cash: need ${cost:,.2f} but only have ${cash:,.2f}"
-
-        # Deduct cash
-        await db.execute(
-            "UPDATE users_profile SET cash_balance = cash_balance - ? WHERE id = 'default'",
-            (cost,),
-        )
-
-        # Upsert position
-        cur = await db.execute(
-            "SELECT quantity, avg_cost FROM positions WHERE user_id = 'default' AND ticker = ?",
-            (ticker,),
-        )
-        existing = await cur.fetchone()
-        if existing:
-            old_qty = existing["quantity"]
-            old_cost = existing["avg_cost"]
-            new_qty = old_qty + quantity
-            new_avg = ((old_qty * old_cost) + (quantity * price)) / new_qty
-            await db.execute(
-                "UPDATE positions SET quantity = ?, avg_cost = ?, updated_at = ? "
-                "WHERE user_id = 'default' AND ticker = ?",
-                (new_qty, new_avg, now, ticker),
-            )
-        else:
-            await db.execute(
-                "INSERT INTO positions (id, user_id, ticker, quantity, avg_cost, updated_at) "
-                "VALUES (?, 'default', ?, ?, ?, ?)",
-                (str(uuid.uuid4()), ticker, quantity, price, now),
-            )
-
-    elif side == "sell":
-        cur = await db.execute(
-            "SELECT quantity, avg_cost FROM positions WHERE user_id = 'default' AND ticker = ?",
-            (ticker,),
-        )
-        existing = await cur.fetchone()
-        if not existing or existing["quantity"] < quantity:
-            held = existing["quantity"] if existing else 0
-            return f"Insufficient shares: want to sell {quantity} {ticker} but hold {held}"
-
-        price = existing["avg_cost"]  # sell at avg cost for now
-        proceeds = price * quantity
-        new_qty = existing["quantity"] - quantity
-
-        await db.execute(
-            "UPDATE users_profile SET cash_balance = cash_balance + ? WHERE id = 'default'",
-            (proceeds,),
-        )
-
-        if new_qty <= 0:
-            await db.execute(
-                "DELETE FROM positions WHERE user_id = 'default' AND ticker = ?",
-                (ticker,),
-            )
-        else:
-            await db.execute(
-                "UPDATE positions SET quantity = ?, updated_at = ? "
-                "WHERE user_id = 'default' AND ticker = ?",
-                (new_qty, now, ticker),
-            )
-    else:
-        return f"Invalid side: {side}"
-
-    # Record trade
-    await db.execute(
-        "INSERT INTO trades (id, user_id, ticker, side, quantity, price, executed_at) "
-        "VALUES (?, 'default', ?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), ticker, side, quantity, price, now),
-    )
-    await db.commit()
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Watchlist changes
 # ---------------------------------------------------------------------------
 
@@ -303,27 +260,37 @@ async def _execute_trade(
 async def _execute_watchlist_change(db, ticker: str, action: str) -> str | None:
     """Add/remove a ticker from watchlist. Returns error string on failure."""
     now = datetime.now(timezone.utc).isoformat()
+    ticker = ticker.upper().strip()
 
     if action == "add":
-        try:
-            await db.execute(
-                "INSERT INTO watchlist (id, user_id, ticker, added_at) VALUES (?, 'default', ?, ?)",
-                (str(uuid.uuid4()), ticker.upper(), now),
-            )
-            await db.commit()
-        except Exception:
+        cur = await db.execute(
+            "SELECT id FROM watchlist WHERE user_id = 'default' AND ticker = ?",
+            (ticker,),
+        )
+        if await cur.fetchone():
             return f"{ticker} is already on the watchlist"
+        await db.execute(
+            "INSERT INTO watchlist (id, user_id, ticker, added_at) VALUES (?, 'default', ?, ?)",
+            (str(uuid.uuid4()), ticker, now),
+        )
+        provider = get_provider()
+        if provider is not None:
+            await provider.add_ticker(ticker)
+        return None
 
-    elif action == "remove":
+    if action == "remove":
         cur = await db.execute(
             "DELETE FROM watchlist WHERE user_id = 'default' AND ticker = ?",
-            (ticker.upper(),),
+            (ticker,),
         )
-        await db.commit()
         if cur.rowcount == 0:
             return f"{ticker} is not on the watchlist"
+        provider = get_provider()
+        if provider is not None:
+            await provider.remove_ticker(ticker)
+        return None
 
-    return None
+    return f"Invalid watchlist action: {action}"
 
 
 # ---------------------------------------------------------------------------
@@ -332,18 +299,24 @@ async def _execute_watchlist_change(db, ticker: str, action: str) -> str | None:
 
 
 async def _call_llm(messages: list[dict]) -> ChatResponse:
-    """Call LLM via LiteLLM -> OpenRouter and parse structured response."""
+    """Call LiteLLM via OpenRouter with Cerebras provider routing and parse
+    the structured JSON response. Raises HTTPException(502) on
+    parse/validation failure."""
     response = await acompletion(
         model="openrouter/openai/gpt-oss-120b",
         messages=messages,
-        extra_body={
-            "response_format": {"type": "json_object"},
-        },
+        response_format={"type": "json_schema", "json_schema": RESPONSE_JSON_SCHEMA},
+        extra_body={"provider": {"order": ["cerebras"], "allow_fallbacks": False}},
     )
-
     content = response.choices[0].message.content
-    parsed = json.loads(content)
-    return ChatResponse(**parsed)
+    try:
+        parsed = json.loads(content)
+        return ChatResponse(**parsed)
+    except (json.JSONDecodeError, ValidationError, TypeError) as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Malformed LLM response: {e}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -356,50 +329,37 @@ async def chat(req: ChatRequest):
     """Send a message and receive a structured response with auto-executed actions."""
     db = await get_db()
     try:
-        # Check mock mode
         if os.environ.get("LLM_MOCK", "").lower() == "true":
             result = _mock_response(req.message)
         else:
-            # Build LLM messages
             portfolio_ctx = await _load_portfolio_context(db)
             history = await _load_history(db)
-
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "system",
-                    "content": f"Current portfolio state:\n{portfolio_ctx}",
-                },
+                {"role": "system", "content": f"Current portfolio state:\n{portfolio_ctx}"},
                 *history,
                 {"role": "user", "content": req.message},
             ]
-
             result = await _call_llm(messages)
 
-        # Auto-execute trades
-        errors = []
+        errors: list[str] = []
+
         if result.trades:
             for trade in result.trades:
-                err = await _execute_trade(
-                    db, trade.ticker, trade.side, trade.quantity
-                )
-                if err:
-                    errors.append(err)
+                try:
+                    await perform_trade(db, trade.ticker, trade.quantity, trade.side)
+                except TradeValidationError as e:
+                    errors.append(str(e))
 
-        # Auto-execute watchlist changes
         if result.watchlist_changes:
             for change in result.watchlist_changes:
-                err = await _execute_watchlist_change(
-                    db, change.ticker, change.action
-                )
+                err = await _execute_watchlist_change(db, change.ticker, change.action)
                 if err:
                     errors.append(err)
 
-        # Append errors to message if any
         if errors:
             result.message += "\n\n(Errors: " + "; ".join(errors) + ")"
 
-        # Store messages
         now = datetime.now(timezone.utc).isoformat()
         await db.execute(
             "INSERT INTO chat_messages (id, user_id, role, content, actions, created_at) "
@@ -409,7 +369,9 @@ async def chat(req: ChatRequest):
 
         actions_json = None
         if result.trades or result.watchlist_changes:
-            actions_json = json.dumps(result.model_dump(exclude={"message"}, exclude_none=True))
+            actions_json = json.dumps(
+                result.model_dump(exclude={"message"}, exclude_none=True)
+            )
 
         await db.execute(
             "INSERT INTO chat_messages (id, user_id, role, content, actions, created_at) "
