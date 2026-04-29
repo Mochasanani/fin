@@ -10,6 +10,7 @@ interface WatchlistProps {
   priceHistory: Record<string, { price: number }[]>;
   selectedTicker: string | null;
   onSelectTicker: (ticker: string) => void;
+  refreshKey?: number;
 }
 
 export default function Watchlist({
@@ -17,6 +18,7 @@ export default function Watchlist({
   priceHistory,
   selectedTicker,
   onSelectTicker,
+  refreshKey,
 }: WatchlistProps) {
   const [tickers, setTickers] = useState<string[]>([]);
   const [newTicker, setNewTicker] = useState("");
@@ -25,7 +27,7 @@ export default function Watchlist({
     api.getWatchlist().then((items) => {
       setTickers(items.map((i) => i.ticker));
     }).catch(() => {});
-  }, []);
+  }, [refreshKey]);
 
   const addTicker = useCallback(() => {
     const t = newTicker.trim().toUpperCase();

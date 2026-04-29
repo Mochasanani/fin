@@ -43,6 +43,12 @@ export default function Home() {
   const { prices, connectionStatus, priceHistory } = useMarketData();
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
   const { portfolio, refresh: refreshPortfolio } = usePortfolio();
+  const [watchlistRefreshKey, setWatchlistRefreshKey] = useState(0);
+
+  const refreshAfterChat = useCallback(() => {
+    refreshPortfolio();
+    setWatchlistRefreshKey((k) => k + 1);
+  }, [refreshPortfolio]);
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
@@ -64,6 +70,7 @@ export default function Home() {
                 priceHistory={priceHistory}
                 selectedTicker={selectedTicker}
                 onSelectTicker={setSelectedTicker}
+                refreshKey={watchlistRefreshKey}
               />
             </Panel>
 
@@ -96,7 +103,7 @@ export default function Home() {
         </div>
 
         {/* Chat sidebar */}
-        <ChatPanel onDataRefresh={refreshPortfolio} />
+        <ChatPanel onDataRefresh={refreshAfterChat} />
       </div>
     </div>
   );

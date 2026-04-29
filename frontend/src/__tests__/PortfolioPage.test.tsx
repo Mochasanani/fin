@@ -171,6 +171,38 @@ describe("Portfolio Page Integration", () => {
     });
   });
 
+  it("refreshes watchlist after chat watchlist change", async () => {
+    vi.mocked(api.getPortfolio).mockResolvedValue({
+      cash_balance: 10000.0,
+      total_value: 10000.0,
+      positions: [],
+    });
+    vi.mocked(api.getWatchlist)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ ticker: "TSLA" }]);
+    vi.mocked(api.chat).mockResolvedValue({
+      message: "Added TSLA.",
+      watchlist_changes: [{ ticker: "TSLA", action: "add" }],
+    });
+
+    render(<Home />);
+
+    await waitFor(() => {
+      expect(api.getWatchlist).toHaveBeenCalledTimes(1);
+    });
+
+    const chatInput = screen.getByPlaceholderText("Message...");
+    fireEvent.change(chatInput, { target: { value: "Add TSLA" } });
+    fireEvent.click(screen.getByText("Send"));
+
+    await waitFor(() => {
+      expect(api.chat).toHaveBeenCalledWith("Add TSLA");
+    });
+    await waitFor(() => {
+      expect(api.getWatchlist).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("handles API failure gracefully", async () => {
     vi.mocked(api.getPortfolio).mockRejectedValue(new Error("Network error"));
 
