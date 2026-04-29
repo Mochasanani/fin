@@ -2,6 +2,7 @@
 .claude/
 .beads/
 .logs/
+CLAUDE.md
 
 # Dependencies
 node_modules/
@@ -12,12 +13,16 @@ __pycache__/
 .env
 
 # Database
-db/
+db/finally.db
 **/db/finally.db
 
 # Next.js
 .next/
 out/
+
+# Build output
+dist/
+build/
 
 # Test artifacts
 .pytest_cache/
