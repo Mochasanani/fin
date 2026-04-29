@@ -20,6 +20,10 @@ RUN cd backend && uv sync --frozen --no-dev
 # Copy frontend build output as static files
 COPY --from=frontend-build /build/out/ static/
 
+# Persist DB inside the named volume mount point
+ENV DB_PATH=/app/db/finally.db
+RUN mkdir -p /app/db
+
 EXPOSE 8000
 
 WORKDIR /app/backend
