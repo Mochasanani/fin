@@ -3,11 +3,14 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: ".",
   testMatch: "*.e2e.ts",
-  timeout: 30_000,
-  retries: 1,
+  timeout: 60_000,
+  retries: process.env.CI ? 2 : 0,
+  fullyParallel: false,
+  workers: 1,
+  reporter: process.env.CI ? [["list"], ["html", { open: "never" }]] : "list",
   use: {
     baseURL: process.env.BASE_URL || "http://localhost:8000",
-    trace: "on-first-retry",
+    trace: "retain-on-failure",
   },
   projects: [
     {

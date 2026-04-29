@@ -1,0 +1,29 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      - LLM_MOCK=true
+      - MASSIVE_API_KEY=
+      - DB_PATH=/tmp/test.db
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/health\")' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.52.0-jammy
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      - BASE_URL=http://app:8000
+      - CI=true
+    working_dir: /work
+    volumes:
+      - .:/work
+    # Install pinned @playwright/test (1.52.0 matches the image's bundled browsers).
+    command: sh -c "npm install --no-audit --no-fund --silent && npx playwright test"

@@ -1,6 +1,6 @@
 """FastAPI application entry point."""
 
-import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.chat import router as chat_router
-from app.database import init_db
+from app.database import init_db, reset_db
 from app.market.provider import create_provider
 from app.market.stream import router as stream_router
 from app.portfolio import router as portfolio_router
@@ -40,6 +40,16 @@ app.include_router(watchlist_router)
 @app.get("/api/health")
 async def health():
     return JSONResponse({"status": "ok"})
+
+
+# Test-only reset endpoint. Active only when LLM_MOCK=true so production cannot
+# be wiped by a stray request. Used by Playwright between tests.
+if os.environ.get("LLM_MOCK", "").lower() == "true":
+
+    @app.post("/api/test/reset")
+    async def test_reset():
+        await reset_db()
+        return JSONResponse({"status": "reset"})
 
 
 # Serve static files (Next.js export) at root, if the directory exists

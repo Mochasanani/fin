@@ -83,16 +83,40 @@ async def init_db():
         cursor = await db.execute("SELECT COUNT(*) FROM users_profile")
         row = await cursor.fetchone()
         if row[0] == 0:
-            now = datetime.now(timezone.utc).isoformat()
-            await db.execute(
-                "INSERT INTO users_profile (id, cash_balance, created_at) VALUES (?, ?, ?)",
-                ("default", 10000.0, now),
-            )
-            for ticker in DEFAULT_TICKERS:
-                await db.execute(
-                    "INSERT INTO watchlist (id, user_id, ticker, added_at) VALUES (?, ?, ?, ?)",
-                    (str(uuid.uuid4()), "default", ticker, now),
-                )
+            await _seed_defaults(db)
             await db.commit()
+    finally:
+        await db.close()
+
+
+async def _seed_defaults(db) -> None:
+    """Insert the default user profile and watchlist tickers."""
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO users_profile (id, cash_balance, created_at) VALUES (?, ?, ?)",
+        ("default", 10000.0, now),
+    )
+    for ticker in DEFAULT_TICKERS:
+        await db.execute(
+            "INSERT INTO watchlist (id, user_id, ticker, added_at) VALUES (?, ?, ?, ?)",
+            (str(uuid.uuid4()), "default", ticker, now),
+        )
+
+
+async def reset_db() -> None:
+    """Wipe all user state and reseed defaults. Test-only helper."""
+    db = await get_db()
+    try:
+        for table in (
+            "trades",
+            "positions",
+            "portfolio_snapshots",
+            "chat_messages",
+            "watchlist",
+            "users_profile",
+        ):
+            await db.execute(f"DELETE FROM {table}")
+        await _seed_defaults(db)
+        await db.commit()
     finally:
         await db.close()
