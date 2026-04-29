@@ -131,4 +131,128 @@ describe("Watchlist", () => {
     expect(within(thead).getByText("Price")).toBeInTheDocument();
     expect(within(thead).getByText("Chg%")).toBeInTheDocument();
   });
+
+  it("removes a ticker via the remove button", async () => {
+    vi.mocked(api.getWatchlist).mockResolvedValue([{ ticker: "AAPL" }]);
+
+    render(
+      <Watchlist
+        prices={basePrices}
+        priceHistory={{}}
+        selectedTicker={null}
+        onSelectTicker={vi.fn()}
+      />
+    );
+
+    const removeBtn = await screen.findByTitle("Remove");
+    fireEvent.click(removeBtn);
+
+    expect(api.removeTicker).toHaveBeenCalledWith("AAPL");
+    await waitFor(() => expect(screen.queryByText("AAPL")).not.toBeInTheDocument());
+  });
+
+  it("does not call onSelectTicker when clicking the remove button", async () => {
+    vi.mocked(api.getWatchlist).mockResolvedValue([{ ticker: "AAPL" }]);
+    const onSelect = vi.fn();
+
+    render(
+      <Watchlist
+        prices={basePrices}
+        priceHistory={{}}
+        selectedTicker={null}
+        onSelectTicker={onSelect}
+      />
+    );
+
+    const removeBtn = await screen.findByTitle("Remove");
+    fireEvent.click(removeBtn);
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("applies flash-up class on uptick price update", async () => {
+    vi.mocked(api.getWatchlist).mockResolvedValue([{ ticker: "AAPL" }]);
+
+    const { container, rerender } = render(
+      <Watchlist
+        prices={{
+          AAPL: {
+            ticker: "AAPL",
+            price: 150.0,
+            previous_price: 150.0,
+            timestamp: "2026-01-01T00:00:00Z",
+            direction: "flat",
+          },
+        }}
+        priceHistory={{}}
+        selectedTicker={null}
+        onSelectTicker={vi.fn()}
+      />
+    );
+
+    await screen.findByText("AAPL");
+
+    rerender(
+      <Watchlist
+        prices={{
+          AAPL: {
+            ticker: "AAPL",
+            price: 151.0,
+            previous_price: 150.0,
+            timestamp: "2026-01-01T00:00:01Z",
+            direction: "up",
+          },
+        }}
+        priceHistory={{}}
+        selectedTicker={null}
+        onSelectTicker={vi.fn()}
+      />
+    );
+
+    const row = container.querySelector("tbody tr")!;
+    await waitFor(() => expect(row.classList.contains("flash-up")).toBe(true));
+  });
+
+  it("applies flash-down class on downtick price update", async () => {
+    vi.mocked(api.getWatchlist).mockResolvedValue([{ ticker: "AAPL" }]);
+
+    const { container, rerender } = render(
+      <Watchlist
+        prices={{
+          AAPL: {
+            ticker: "AAPL",
+            price: 150.0,
+            previous_price: 150.0,
+            timestamp: "2026-01-01T00:00:00Z",
+            direction: "flat",
+          },
+        }}
+        priceHistory={{}}
+        selectedTicker={null}
+        onSelectTicker={vi.fn()}
+      />
+    );
+
+    await screen.findByText("AAPL");
+
+    rerender(
+      <Watchlist
+        prices={{
+          AAPL: {
+            ticker: "AAPL",
+            price: 149.0,
+            previous_price: 150.0,
+            timestamp: "2026-01-01T00:00:01Z",
+            direction: "down",
+          },
+        }}
+        priceHistory={{}}
+        selectedTicker={null}
+        onSelectTicker={vi.fn()}
+      />
+    );
+
+    const row = container.querySelector("tbody tr")!;
+    await waitFor(() => expect(row.classList.contains("flash-down")).toBe(true));
+  });
 });
