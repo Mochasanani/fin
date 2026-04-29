@@ -13,3 +13,9 @@ class MarketDataProvider(ABC):
     @abstractmethod
     async def stop(self) -> None:
         """Stop producing price updates."""
+
+    async def add_ticker(self, ticker: str) -> None:
+        """Ensure the provider is tracking this ticker. Default no-op."""
+
+    async def remove_ticker(self, ticker: str) -> None:
+        """Stop tracking this ticker. Default no-op."""
